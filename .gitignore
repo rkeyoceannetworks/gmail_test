@@ -1,0 +1,18 @@
+# Explicitly ignore Google OAuth API secrets and tokens
+client_secret_*.json
+credentials.json
+token.json
+settings.json
+
+# Ignore local configuration, logs, and state files
+devices.json
+*.log
+*.log.*
+*.txt
+alert_sent.bin
+
+# Ignore local python virtual environments
+env/
+__pycache__/
+*.py[cod]
+
