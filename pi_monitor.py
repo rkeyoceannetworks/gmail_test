@@ -9,8 +9,10 @@ import sys
 import socket
 import json
 import logging
+import http.client
 from logging.handlers import RotatingFileHandler
 from email.message import EmailMessage
+from email.utils import parsedate_to_datetime
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -93,12 +95,54 @@ def get_power_status():
         logging.error(f"Power status check failed: {e}")
         return "Unknown", "Unknown", False
 
+
+def format_drift(seconds):
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins, secs = divmod(rem, 60)
+
+    parts = []
+    if days >= 1:
+        parts.append(f"{int(days)}d")
+    if hours >= 1 or days >= 1:
+        parts.append(f"{int(hours)}h")
+    if mins >= 1 or hours >= 1 or days >= 1:
+        parts.append(f"{int(mins)}m")
+    parts.append(f"{secs:.1f}s")
+    return " ".join(parts)
+
+def check_clock_drift(max_drift_sec=300):
+    try:
+        conn = http.client.HTTPConnection("www.google.com", 80, timeout=5)
+        conn.request("HEAD", "/")
+        res = conn.getresponse()
+        date_header = res.getheader("Date")
+        conn.close()
+
+        if not date_header:
+            return "Unknown", False
+
+        server_utc = parsedate_to_datetime(date_header)
+        local_utc = datetime.datetime.now(datetime.timezone.utc)
+        drift = abs((local_utc - server_utc).total_seconds())
+        drift_str = format_drift(drift)
+
+        if drift > max_drift_sec:
+            logging.warning(f"Clock drift detected: off by {drift_str}!")
+            return f"⚠️ DRIFT ({drift_str} off)", True
+
+        return f"✅ Synced ({drift:.1f}s)", False
+    except Exception as e:
+        logging.error(f"Clock drift check failed: {e}")
+        return "Unknown", False
+
 def ping_devices():
     devices = load_json(DEVICES_FILE)
     if not devices: return "No devices configured.", 0
     
     results = []
     offline_count = 0
+    offline_devices = []
     for name, ip in devices.items():
 #        res = subprocess.run(['/bin/ping', '-c', '2', '-W', '2', ip], stdout=subprocess.DEVNULL)
         # /bin/ping: Absolute path so systemd doesn't get lost
@@ -108,10 +152,11 @@ def ping_devices():
         res = subprocess.run(['/bin/ping', '-c', '1', '-W', '1', ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         status = "✅ ONLINE " if res.returncode == 0 else "❌ OFFLINE"
         if res.returncode != 0: 
+            offline_devices.append(name)
             offline_count += 1
             logging.warning(f"Device Offline: {name} ({ip})")
         results.append(f"{status} | {name:<20} ({ip})")
-    return "\n".join(results), offline_count
+    return "\n".join(results), offline_count, offline_devices
 
 def get_top_processes_summary():
     proc_list = []
@@ -199,7 +244,7 @@ def get_device_ips():
 
     return primary_ip, tailscale_ip
 
-def get_report():
+def get_report(max_drift=300):
     hostname, mac = get_identity()
     with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
         temp = int(f.read()) / 1000.0
@@ -208,7 +253,8 @@ def get_report():
     mem = psutil.virtual_memory()
     disk = shutil.disk_usage("/")
     core_v, pwr_s, is_uv = get_power_status()
-    net_report, off_c = ping_devices()
+    clock_s, is_drifted = check_clock_drift(max_drift) # check if the local clock has drifted
+    net_report, off_c, offline_devices = ping_devices()
     
     # --- GET NEW DATA ---
     backup_stat = get_backup_status()
@@ -220,6 +266,7 @@ def get_report():
 ===== {hostname.upper()} SYSTEM REPORT =====
 Timestamp: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 Uptime:    {uptime}
+Clock:     {clock_s}
 IP Addr:   {ip_addr}
 MAC Addr:  {mac}
 Tailscale: {vpn_ip}
@@ -248,7 +295,8 @@ PID      %RAM     NAME
 {get_top_processes_summary()}
 ===========================================
 """
-    return full_text, temp, is_uv, off_c, hostname
+    return full_text, temp, is_uv, off_c, offline_devices, is_drifted, hostname
+
 def send_email(content, subject_prefix, hostname):
     settings = load_json(SETTINGS_FILE)
     if not settings: return
@@ -289,35 +337,91 @@ if __name__ == '__main__':
     thresholds = settings.get('thresholds', {})
     t_alert = thresholds.get('temp_alert', 75.0)
     t_reco  = thresholds.get('temp_recovery', 70.0)
+    c_drift = thresholds.get('clock_drift_seconds', 300)
 
-    report, cur_temp, is_uv, off_c, host = get_report()
-    has_flag = os.path.exists(FLAG_FILE)
+    report, cur_temp, is_uv, off_c, offline_devices, is_drifted, host = get_report(c_drift) #get a report of system status and pass in the clock drift threashold
+   # has_flag = os.path.exists(FLAG_FILE)
     
-    is_critical = cur_temp > t_alert or is_uv or off_c > 0
+   # Load previous alert state (handles legacy plain-text "active" file safely)
+    prev_state = {}
+    has_flag = os.path.exists(FLAG_FILE)
+    if has_flag:
+        try:
+            with open(FLAG_FILE, 'r') as f:
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    prev_state = loaded
+        except Exception:
+            prev_state = {}
+   
+   # Preserve temperature hysteresis (stays active until temp drops below t_reco)
+    was_temp_alert = prev_state.get('temp', False)
+    temp_active = (cur_temp >= t_reco) if was_temp_alert else (cur_temp > t_alert)
+
+    curr_state = {
+        'temp': temp_active,
+        'uv': bool(is_uv),
+        'drift': bool(is_drifted),
+        'offline_devices': sorted(offline_devices)
+    }
+
+   # Check if any NEW issue appeared that wasn't already alerted
+    prev_offline = set(prev_state.get('offline_devices', []))
+    new_offline = [d for d in curr_state['offline_devices'] if d not in prev_offline]
+
+    has_new_issue = (
+        (curr_state['temp'] and not prev_state.get('temp', False)) or
+        (curr_state['uv'] and not prev_state.get('uv', False)) or
+        (curr_state['drift'] and not prev_state.get('drift', False)) or
+        len(new_offline) > 0
+    )
+
+
+#    is_critical = cur_temp > t_alert or is_uv or off_c > 0 or is_drifted
+
+    is_critical = curr_state['temp'] or curr_state['uv'] or curr_state['drift'] or off_c > 0
 
     if '--daily' in sys.argv:
         logging.info("Triggering scheduled daily report.")
         send_email(report, "📊 DAILY", host)
     
-    elif is_critical and not has_flag:
-        subject = "🚨 ALERT"
-        if cur_temp > t_alert: subject += " 🔥"
-        if is_uv: subject += " ⚡"
-        if off_c > 0: subject += " ❌"
-        logging.warning(f"CRITICAL STATE DETECTED: Temp={cur_temp}, UV={is_uv}, Offline={off_c}")
-        send_email(report, subject, host)
-        # Create the flag file to prevent spam
-        with open(FLAG_FILE, 'w') as f: f.write("active")
+#    elif is_critical and not has_flag:
+#        subject = "🚨 ALERT"
+#        if cur_temp > t_alert: subject += " 🔥"
+#        if is_uv: subject += " ⚡"
+#        if off_c > 0: subject += " ❌"
+#        if is_drifted: subject += " ⏰"
+#        logging.warning(f"CRITICAL STATE DETECTED: Temp={cur_temp}, UV={is_uv}, Offline={off_c}, Drift={is_drifted}")
+#        send_email(report, subject, host)
+#        # Create the flag file to prevent spam
+#        with open(FLAG_FILE, 'w') as f: f.write("active")
 
-    elif not is_critical and has_flag and cur_temp < t_reco:
+    elif has_new_issue:
+        subject = "🚨 ALERT"
+        if curr_state['temp']: subject += " 🔥"
+        if curr_state['uv']: subject += " ⚡"
+        if off_c > 0: subject += " ❌"
+        if curr_state['drift']: subject += " ⏰"
+        logging.warning(f"NEW CRITICAL STATE DETECTED: Temp={cur_temp}, UV={is_uv}, Offline={offline_devices}, Drift={is_drifted}")
+        send_email(report, subject, host)
+        with open(FLAG_FILE, 'w') as f:
+            json.dump(curr_state, f)
+
+
+#    elif not is_critical and has_flag and cur_temp < t_reco:
+    elif not is_critical and has_flag:
         logging.info("System recovery detected. Resetting flags.")
         send_email(report, "❄️ RECOVERY", host)
         # Remove the flag file to allow future alerts
         os.remove(FLAG_FILE)
 
     else:
+        # If still critical but an individual sub-issue resolved, update the state file silently
+        if is_critical and curr_state != prev_state:
+            with open(FLAG_FILE, 'w') as f:
+                json.dump(curr_state, f)
         # Log normal status for the log file history
-        logging.info(f"Status OK. Temp: {cur_temp}C | UV: {is_uv} | Offline: {off_c}")
+        logging.info(f"Status OK. Temp: {cur_temp}C | UV: {is_uv} | Offline: {off_c} | Drift: {is_drifted}")
 
     if '--v' in sys.argv:
         logging.info("spill the beans here later")
